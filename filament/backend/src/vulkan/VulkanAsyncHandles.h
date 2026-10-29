@@ -280,34 +280,15 @@ struct VulkanTimerQuery : public HwTimerQuery, fvkmemory::ThreadSafeResource {
         : mStartingQueryIndex(startingIndex),
           mStoppingQueryIndex(stoppingIndex) {}
 
-    void setFence(std::shared_ptr<VulkanCmdFence> fence) noexcept {
-        utils::LockGuard const lock(mFenceMutex);
-        mFence = std::move(fence);
-    }
+    uint32_t getStartingQueryIndex() const noexcept { return mStartingQueryIndex; }
 
-    bool isCompleted() noexcept {
-        utils::LockGuard const lock(mFenceMutex);
-        // QueryValue is a synchronous call and might occur before beginTimerQuery has written
-        // anything into the command buffer, which is an error according to the validation layer
-        // that ships in the Android NDK.  Even when AVAILABILITY_BIT is set, validation seems to
-        // require that the timestamp has at least been written into a processed command buffer.
-
-        // This fence indicates that the corresponding buffer has been completed.
-        return mFence && mFence->getStatus() == VK_SUCCESS;
-    }
-
-    uint32_t getStartingQueryIndex() const { return mStartingQueryIndex; }
-
-    uint32_t getStoppingQueryIndex() const {
+    uint32_t getStoppingQueryIndex() const noexcept {
         return mStoppingQueryIndex;
     }
 
 private:
     uint32_t mStartingQueryIndex;
     uint32_t mStoppingQueryIndex;
-
-    std::shared_ptr<VulkanCmdFence> mFence;
-    utils::Mutex mFenceMutex;
 };
 
 } // namespace filament::backend
