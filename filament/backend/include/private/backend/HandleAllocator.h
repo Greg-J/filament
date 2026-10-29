@@ -237,17 +237,73 @@ private:
         return P2;
     }
 
+    /*
+     * Memory layout of Allocator's shared arena:
+     *
+     * Instead of partitioning the arena upfront into three fixed sub-pools, all three size buckets
+     * (P0, P1, P2) share a single contiguous arena [mArea.begin(), mEnd) with a lazy high-water
+     * mark pointer (mCur) and three recycled freelists (mPool0, mPool1, mPool2):
+     *
+     *   mArea.begin()                                             mCur                  mEnd
+     *   v                                                         v                     v
+     *   +-----+------------------+------------------+-------------+---------------------+
+     *   | pad |  slot (P1)       |  slot (P0)       |  slot (P2)  |  untouched pages    |
+     *   +-----+------------------+------------------+-------------+---------------------+
+     *         ^                  ^                  ^             ^
+     *         p0                 p1                 p2            next bump allocation
+     *         |<-- touched physical memory (high-water mark) ---->|
+     *
+     * Per-slot layout and alignment:
+     *
+     * mCur is initially aligned with pointermath::align(mArea.begin(), MIN_ALIGNMENT, sizeof(Node))
+     * so that p0 is MIN_ALIGNMENT-aligned and has at least sizeof(Node) (1 byte) before it.
+     * Advancing mCur by getAlignedSlotSize<Pi>() (which is a multiple of MIN_ALIGNMENT) guarantees
+     * that every subsequent mCur stays MIN_ALIGNMENT-aligned and reserves space at the end of the
+     * slot for the next slot's Node header:
+     *
+     *         |<--------------- getAlignedSlotSize<Pi>() -------------->|
+     *   ... --+----------------------+------------------------+---------+------+ ...
+     *         |   payload (Pi bytes) |   alignment padding    |  Node   | next |
+     *         |   (or FreeList next) |  (slotSize - Pi - 1 B) | { age } | slot |
+     *   ... --+----------------------+------------------------+---------+------+ ...
+     *   ^     ^                                               ^         ^
+     *   |     p (MIN_ALIGNMENT-aligned)                       |         next p (or mCur)
+     *   p[-1] = Node { age } for p                            next_p[-1] = Node { age } for next_p
+     *
+     * The padding is getAlignedSlotSize<Pi>() - Pi - sizeof(Node) bytes, i.e. MIN_ALIGNMENT - 1
+     * when Pi is a multiple of MIN_ALIGNMENT, and fewer otherwise (e.g. 7 bytes for P2 = 184 with
+     * a 16-byte MIN_ALIGNMENT, since the slot rounds up to 192).
+     *
+     * Allocation & deallocation flow:
+     *   1. alloc(size) first checks the matching recycled freelist (mPool0, mPool1, or mPool2):
+     *        mPool0 (P0): mHead -> [freed P0 slot] -> [freed P0 slot] -> nullptr
+     *        mPool1 (P1): mHead -> [freed P1 slot] -> nullptr
+     *        mPool2 (P2): mHead -> nullptr
+     *      If non-empty, it pops a recycled slot p and returns its existing p[-1].age.
+     *   2. Otherwise, it bump-allocates from mCur, advances mCur by getAlignedSlotSize<Pi>(),
+     *      and initializes p[-1].age = 0. Pages beyond mCur are never touched.
+     *   3. free(p, size, age) verifies p[-1].age == age, increments p[-1].age (mod 16), and
+     *      pushes p onto mPool0, mPool1, or mPool2 for future reuse.
+     */
     class Allocator {
         friend class HandleAllocator;
         static constexpr size_t MIN_ALIGNMENT = alignof(std::max_align_t);
         struct Node { uint8_t age; };
-        // Note: using the `extra` parameter of PoolAllocator<>, even with a 1-byte structure,
-        // generally increases all pool allocations by 8-bytes because of alignment restrictions.
+        // Freed slots are threaded through utils::FreeList, which stores its `next` pointer in
+        // the first bytes of the payload, so even the smallest bucket must be able to hold it.
+        static_assert(P0 >= sizeof(utils::FreeList::Node),
+                "P0 must accommodate at least a utils::FreeList::Node");
+        // Note: having a 1-byte Node structure before each allocation increases all pool slot
+        // strides by MIN_ALIGNMENT bytes because of alignment restrictions.
         template<size_t SIZE>
-        using Pool = utils::PoolAllocator<SIZE, MIN_ALIGNMENT, sizeof(Node)>;
-        Pool<P0> mPool0;
-        Pool<P1> mPool1;
-        Pool<P2> mPool2;
+        static constexpr size_t getAlignedSlotSize() noexcept {
+            return (SIZE + sizeof(Node) + MIN_ALIGNMENT - 1) & ~(MIN_ALIGNMENT - 1);
+        }
+        utils::FreeList mPool0;
+        utils::FreeList mPool1;
+        utils::FreeList mPool2;
+        char* mCur = nullptr;
+        char* mEnd = nullptr;
         UTILS_UNUSED_IN_RELEASE const utils::AreaPolicy::HeapArea& mArea;
         bool mUseAfterFreeCheckDisabled;
     public:
@@ -258,21 +314,33 @@ private:
         // this is in fact always called with a constexpr size argument
         [[nodiscard]] inline void* alloc(size_t size, size_t, size_t, uint8_t* outAge) noexcept {
             void* p = nullptr;
-            if      (size <= mPool0.getSize()) p = mPool0.alloc(size);
-            else if (size <= mPool1.getSize()) p = mPool1.alloc(size);
-            else if (size <= mPool2.getSize()) p = mPool2.alloc(size);
+            if      (size <= P0) p = mPool0.pop(0);
+            else if (size <= P1) p = mPool1.pop(0);
+            else if (size <= P2) p = mPool2.pop(0);
             if (UTILS_LIKELY(p)) {
                 Node const* const pNode = static_cast<Node const*>(p);
                 // we are guaranteed to have at least sizeof<Node> bytes of extra storage before
                 // the allocation address.
                 *outAge = pNode[-1].age;
+                return p;
+            }
+
+            size_t const slotSize = (size <= P0) ? getAlignedSlotSize<P0>() :
+                                    (size <= P1) ? getAlignedSlotSize<P1>() :
+                                                   getAlignedSlotSize<P2>();
+            if (UTILS_LIKELY(size <= P2 && static_cast<size_t>(mEnd - mCur) >= slotSize)) {
+                p = mCur;
+                mCur += slotSize;
+                Node* const pNode = static_cast<Node*>(p);
+                pNode[-1].age = 0;
+                *outAge = 0;
             }
             return p;
         }
 
         // this is in fact always called with a constexpr size argument
         inline void free(void* p, size_t size, uint8_t age) noexcept {
-            assert_invariant(p >= mArea.begin() && (char*)p + size <= (char*)mArea.end());
+            assert_invariant(p >= mArea.begin() && (char*)p + size <= mCur);
 
             // check for double-free
             Node* const pNode = static_cast<Node*>(p);
@@ -283,9 +351,9 @@ private:
             }
             expectedAge = (expectedAge + 1) & 0xF; // fixme
 
-            if (size <= mPool0.getSize()) { mPool0.free(p); return; }
-            if (size <= mPool1.getSize()) { mPool1.free(p); return; }
-            if (size <= mPool2.getSize()) { mPool2.free(p); return; }
+            if (size <= P0) { mPool0.push(p); return; }
+            if (size <= P1) { mPool1.push(p); return; }
+            if (size <= P2) { mPool2.push(p); return; }
         }
     };
 

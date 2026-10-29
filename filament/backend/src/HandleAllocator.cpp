@@ -62,19 +62,14 @@ HandleAllocator<P0, P1, P2>::Allocator::Allocator(AreaPolicy::HeapArea const& ar
                      << area.size();
     }
 
-    // make sure we start with a clean arena. This is needed to ensure that all blocks start
-    // with an age of 0.
-    memset(area.data(), 0, maxHeapSize);
+    if (UTILS_LIKELY(maxHeapSize >= MIN_ALIGNMENT + sizeof(Node))) {
+        mCur = static_cast<char*>(pointermath::align(area.begin(), MIN_ALIGNMENT, sizeof(Node)));
+        mEnd = static_cast<char*>(area.begin()) + maxHeapSize;
+    }
 
-    // size the different pools so that they can all contain the same number of handles
-    size_t const count = maxHeapSize / (P0 + P1 + P2);
-    char* const p0 = static_cast<char*>(area.begin());
-    char* const p1 = p0 + count * P0;
-    char* const p2 = p1 + count * P1;
-
-    mPool0 = Pool<P0>(p0, count * P0);
-    mPool1 = Pool<P1>(p1, count * P1);
-    mPool2 = Pool<P2>(p2, count * P2);
+    mPool0 = FreeList(mCur, mEnd);
+    mPool1 = FreeList(mCur, mEnd);
+    mPool2 = FreeList(mCur, mEnd);
 }
 
 // ------------------------------------------------------------------------------------------------
